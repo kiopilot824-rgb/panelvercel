@@ -121,6 +121,11 @@ async def load_state():
         pw_hash = await r.get(REDIS_PASSWORD_KEY)
         if pw_hash:
             AUTH["password_hash"] = pw_hash
+        global DEFAULT_LINK_DELETED
+        try:
+            DEFAULT_LINK_DELETED = bool(await r.get(REDIS_DEFAULT_DELETED_KEY))
+        except Exception:
+            pass
         tg_raw = await r.get(REDIS_TG_KEY)
         if tg_raw:
             try:
@@ -536,15 +541,35 @@ def client_ip(request: Request) -> str:
 
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
+REDIS_DEFAULT_DELETED_KEY = "x4g:default_deleted"
+DEFAULT_LINK_DELETED = False  # اگر کاربر عمداً «لینک پیش‌فرض» را حذف کرده باشد، دیگر خودکار بازسازی نمی‌شود
+
+def default_link_uid() -> str:
+    uid = hashlib.sha256(f"default{CONFIG['secret']}".encode()).hexdigest()
+    return f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+
+async def mark_default_link_deleted():
+    """وقتی کاربر خودش «لینک پیش‌فرض» را حذف می‌کند (از تلگرام یا پنل وب)،
+    این پرچم را در Redis ثبت می‌کنیم تا ensure_default_link() دیگر آن را
+    خودکار دوباره نسازد. بدون این پرچم، چون ensure_default_link() هر بار
+    که داشبورد باز می‌شود (و هر cold start سرورلس) اجرا می‌شود، لینک حذف‌شده
+    همیشه برمی‌گشت و به‌نظر می‌رسید «حذف کار نمی‌کند»."""
+    global DEFAULT_LINK_DELETED
+    DEFAULT_LINK_DELETED = True
+    r = await get_redis()
+    if r:
+        try:
+            await r.set(REDIS_DEFAULT_DELETED_KEY, "1")
+        except Exception as e:
+            logger.warning(f"Could not persist default_deleted flag: {e}")
 
 async def ensure_default_link():
     global _default_link_created
-    if _default_link_created:
+    if _default_link_created or DEFAULT_LINK_DELETED:
         return
     async with LINKS_LOCK:
         if not any(l.get("is_default") for l in LINKS.values()):
-            uid = hashlib.sha256(f"default{CONFIG['secret']}".encode()).hexdigest()
-            uid = f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
+            uid = default_link_uid()
             if uid not in LINKS:
                 LINKS[uid] = {
                     "label": "لینک پیش‌فرض",
@@ -1283,6 +1308,7 @@ async def handle_telegram_command(token: str, chat_id, text: str):
             async with LINKS_LOCK:
                 label = LINKS[match].get("label", match)
                 sub_id = LINKS[match].get("sub_id")
+                is_default = LINKS[match].get("is_default", False)
                 del LINKS[match]
             if sub_id:
                 async with SUBS_LOCK:
@@ -1290,6 +1316,8 @@ async def handle_telegram_command(token: str, chat_id, text: str):
                         ids = SUBS[sub_id].get("link_ids", [])
                         if match in ids:
                             ids.remove(match)
+            if is_default or match == default_link_uid():
+                await mark_default_link_deleted()
             await redis_delete_link(match)
             await save_state()
             log_activity("link", f"کانفیگ «{label}» از تلگرام حذف شد", "err")
@@ -1367,6 +1395,7 @@ async def handle_telegram_callback(token: str, cq: dict):
                 exists = uid in LINKS
                 label = LINKS[uid].get("label", uid) if exists else uid
                 sub_id = LINKS[uid].get("sub_id") if exists else None
+                is_default = LINKS[uid].get("is_default", False) if exists else False
                 if exists:
                     del LINKS[uid]
             if sub_id:
@@ -1376,6 +1405,8 @@ async def handle_telegram_callback(token: str, cq: dict):
                         if uid in ids:
                             ids.remove(uid)
             if exists:
+                if is_default or uid == default_link_uid():
+                    await mark_default_link_deleted()
                 await redis_delete_link(uid)
                 await save_state()
                 log_activity("link", f"کانفیگ «{label}» از تلگرام حذف شد", "err")
@@ -1727,6 +1758,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
             raise HTTPException(status_code=404, detail="link not found")
         label = LINKS[uid].get("label", uid)
         sub_id = LINKS[uid].get("sub_id")
+        is_default = LINKS[uid].get("is_default", False)
         del LINKS[uid]
     if sub_id:
         async with SUBS_LOCK:
@@ -1734,6 +1766,8 @@ async def delete_link(uid: str, _=Depends(require_auth)):
                 ids = SUBS[sub_id].get("link_ids", [])
                 if uid in ids:
                     ids.remove(uid)
+    if is_default or uid == default_link_uid():
+        await mark_default_link_deleted()
     await redis_delete_link(uid)
     await save_state()
     log_activity("link", f"کانفیگ «{label}» حذف شد", "err")
