@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from collections import deque, defaultdict
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, BackgroundTasks
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -131,12 +131,24 @@ async def load_state():
     except Exception as e:
         logger.warning(f"Could not load state from Redis: {e}")
 
-async def refresh_links_and_subs():
+_LAST_REFRESH_TS = 0.0
+_REFRESH_THROTTLE_SECONDS = 1.2  # از خواندن کامل Redis در فاصله‌های خیلی کوتاه (مثلاً کلیک‌های پی‌درپی دکمه‌های تلگرام) جلوگیری می‌کند
+
+async def refresh_links_and_subs(force: bool = False):
     """قبل از هر پاسخ به کاربر (لیست/مصرف لینک) صدا زده می‌شود تا اگر لینکی توسط
     instance دیگری ساخته/حذف/ویرایش شده، همین‌جا هم دیده شود — این دقیقاً همان
-    چیزی است که باعث می‌شد کانفیگ‌های تازه‌ساخته «بیایند و بروند»."""
+    چیزی است که باعث می‌شد کانفیگ‌های تازه‌ساخته «بیایند و بروند».
+
+    برای جلوگیری از خواندن کامل Redis در هر تک تعامل (مخصوصاً کلیک‌های سریع
+    دکمه‌های تلگرام که باعث کندی/هنگ محسوس می‌شد)، اگر کمتر از
+    _REFRESH_THROTTLE_SECONDS از آخرین رفرش واقعی گذشته باشد، از حافظه‌ی
+    فعلی استفاده می‌شود؛ با force=True می‌توان این رفتار را دور زد."""
+    global _LAST_REFRESH_TS
     r = await get_redis()
     if not r:
+        return
+    now = time.monotonic()
+    if not force and (now - _LAST_REFRESH_TS) < _REFRESH_THROTTLE_SECONDS:
         return
     try:
         links_raw = await r.hgetall(REDIS_LINKS_KEY)
@@ -155,6 +167,7 @@ async def refresh_links_and_subs():
                     SUBS[sid] = json.loads(raw)
                 except Exception:
                     pass
+        _LAST_REFRESH_TS = now
     except Exception as e:
         logger.warning(f"Could not refresh state from Redis: {e}")
 
@@ -202,21 +215,54 @@ async def save_telegram_config():
         logger.warning(f"Could not save telegram config to Redis: {e}")
 
 async def tg_call(token: str, method: str, **params):
-    """یک متد از Telegram Bot API را صدا می‌زند (sendMessage/getMe/setWebhook/...)."""
+    """یک متد از Telegram Bot API را صدا می‌زند (sendMessage/getMe/setWebhook/...).
+    برای جلوگیری از هنگ کردن ربات روی یک درخواست کند، تایم‌اوت کوتاه‌تر شده و
+    یک بار retry سبک (فقط برای خطاهای شبکه/تایم‌اوت، نه خطاهای منطقی تلگرام
+    مثل 400) انجام می‌شود."""
     if not token or not http_client:
         return None
-    try:
-        resp = await http_client.post(TG_API_BASE.format(token=token, method=method), json=params, timeout=15)
-        return resp.json()
-    except Exception as e:
-        logger.warning(f"Telegram API call failed ({method}): {e}")
-        return None
+    url = TG_API_BASE.format(token=token, method=method)
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = await http_client.post(url, json=params, timeout=httpx.Timeout(8.0, connect=4.0))
+            return resp.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            last_err = e
+            continue
+        except Exception as e:
+            logger.warning(f"Telegram API call failed ({method}): {e}")
+            return None
+    logger.warning(f"Telegram API call failed after retry ({method}): {last_err}")
+    return None
 
 async def tg_send(token: str, chat_id, text: str):
     await tg_call(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
 
 def tg_webhook_secret(token: str) -> str:
     return hashlib.sha256(f"tgwh:{token}:{CONFIG['secret']}".encode()).hexdigest()[:40]
+
+# اگر پردازش یک آپدیت کمی طول بکشد، تلگرام همان update_id را دوباره ارسال
+# می‌کند (retry). بدون دِدوپ، این یعنی همان دکمه/دستور دوباره اجرا می‌شود که
+# هم باعث پیام‌های تکراری و هم فشار اضافه روی Redis/CPU و در نتیجه هنگ محسوس
+# می‌شد. یک حافظه‌ی کوچک و سبک از آخرین update_idهای دیده‌شده نگه می‌داریم.
+_TG_SEEN_UPDATE_IDS: deque = deque()
+_TG_SEEN_UPDATE_SET: set = set()
+_TG_SEEN_MAX = 1000
+_TG_DEDUP_LOCK = asyncio.Lock()
+
+async def _tg_is_duplicate_update(update_id) -> bool:
+    if update_id is None:
+        return False
+    async with _TG_DEDUP_LOCK:
+        if update_id in _TG_SEEN_UPDATE_SET:
+            return True
+        _TG_SEEN_UPDATE_IDS.append(update_id)
+        _TG_SEEN_UPDATE_SET.add(update_id)
+        while len(_TG_SEEN_UPDATE_IDS) > _TG_SEEN_MAX:
+            old = _TG_SEEN_UPDATE_IDS.popleft()
+            _TG_SEEN_UPDATE_SET.discard(old)
+        return False
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
@@ -956,7 +1002,10 @@ def tg_help_text() -> str:
         "🌐 <b>گروه‌های ساب</b> — مشاهده گروه‌های ساب\n\n"
         "دستورات متنی هم قابل استفاده‌اند:\n"
         "<code>/newconfig نام حجم_GB روز</code>\n"
-        "<code>/on uuid</code> · <code>/off uuid</code> · <code>/del uuid</code>"
+        "<code>/on uuid</code> · <code>/off uuid</code> · <code>/del uuid</code>\n"
+        "<code>/find متن</code> — جستجوی کانفیگ بر اساس نام\n"
+        "<code>/ping</code> — تست سرعت اتصال ربات\n"
+        "<code>/id</code> — گرفتن Chat ID"
     )
 
 async def tg_status_text() -> str:
@@ -1150,6 +1199,36 @@ async def handle_telegram_command(token: str, chat_id, text: str):
                       parse_mode="HTML", reply_markup=tg_back_kb())
         return
 
+    if cmd == "/ping":
+        t0 = time.monotonic()
+        r = await get_redis()
+        redis_ms = None
+        if r:
+            rt0 = time.monotonic()
+            try:
+                await r.ping()
+                redis_ms = round((time.monotonic() - rt0) * 1000)
+            except Exception:
+                redis_ms = -1
+        tg_t0 = time.monotonic()
+        me = await tg_call(token, "getMe")
+        tg_ms = round((time.monotonic() - tg_t0) * 1000)
+        total_ms = round((time.monotonic() - t0) * 1000)
+        redis_txt = "متصل نیست ⚠️" if redis_ms is None else (f"{redis_ms} ms" if redis_ms >= 0 else "خطا ⚠️")
+        tg_txt = f"{tg_ms} ms" if me and me.get("ok") else "خطا ⚠️"
+        await tg_call(token, "sendMessage", chat_id=chat_id, text=(
+            "🏓 <b>Ping</b>\n\n"
+            f"⚡️ Telegram API: {tg_txt}\n"
+            f"🗄 Redis: {redis_txt}\n"
+            f"⏱ کل پردازش: {total_ms} ms"
+        ), parse_mode="HTML")
+        return
+
+    if cmd == "/id":
+        await tg_call(token, "sendMessage", chat_id=chat_id,
+                      text=f"🆔 Chat ID شما: <code>{chat_id}</code>", parse_mode="HTML")
+        return
+
     if cmd == "/status":
         await tg_call(token, "sendMessage", chat_id=chat_id, text=await tg_status_text(),
                       parse_mode="HTML", reply_markup=tg_back_kb([[{"text": "🔄 بروزرسانی", "callback_data": "status"}]]))
@@ -1158,6 +1237,26 @@ async def handle_telegram_command(token: str, chat_id, text: str):
     if cmd == "/list":
         text_out, kb = await tg_links_page(0)
         await tg_call(token, "sendMessage", chat_id=chat_id, text=text_out, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if cmd == "/find":
+        query = " ".join(args).strip().lower()
+        if not query:
+            await tg_send(token, chat_id, "لطفاً بعد از /find یک عبارت برای جستجو بنویسید.\nمثال: <code>/find تلگرام</code>")
+            return
+        async with LINKS_LOCK:
+            matches = [(uid, d) for uid, d in LINKS.items() if query in (d.get("label", "") or "").lower()]
+        matches.sort(key=lambda kv: kv[1].get("created_at", ""), reverse=True)
+        if not matches:
+            await tg_send(token, chat_id, f"چیزی برای «{query}» پیدا نشد.")
+            return
+        rows = [[{"text": f"{'🟢' if is_link_allowed(d) else '🔴'} {d.get('label', '—')[:28]}", "callback_data": f"link:{uid}"}]
+                for uid, d in matches[:15]]
+        rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+        extra = f"\n(فقط ۱۵ مورد اول از {len(matches)} نتیجه نمایش داده شد)" if len(matches) > 15 else ""
+        await tg_call(token, "sendMessage", chat_id=chat_id,
+                      text=f"🔍 نتایج جستجو برای «{query}» ({len(matches)} مورد){extra}",
+                      parse_mode="HTML", reply_markup={"inline_keyboard": rows})
         return
 
     if cmd == "/newconfig":
@@ -1223,6 +1322,13 @@ async def handle_telegram_callback(token: str, cq: dict):
     if not admin_id or str(from_id) != str(admin_id):
         await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id, text="⛔ دسترسی غیرمجاز", show_alert=True)
         return
+
+    # نکته‌ی مهم برای رفع «هنگ» دکمه‌ها: تا وقتی answerCallbackQuery نرسد،
+    # تلگرام چرخ‌وفلک لودینگ را روی دکمه نگه می‌دارد. قبلاً این تایید در
+    # انتهای پردازش (بعد از refresh از Redis و ویرایش پیام) ارسال می‌شد که
+    # حس هنگ‌کردن ایجاد می‌کرد. حالا بی‌درنگ و بدون انتظار ارسال می‌شود و
+    # ادامه‌ی پردازش (رفرش/ویرایش پیام) موازی با آن انجام می‌شود.
+    asyncio.create_task(tg_call(token, "answerCallbackQuery", callback_query_id=cq_id))
 
     await refresh_links_and_subs()
     ack_text = ""
@@ -1306,12 +1412,18 @@ async def handle_telegram_callback(token: str, cq: dict):
             await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
     except Exception as e:
         logger.warning(f"Telegram callback error: {e}")
-        ack_text = "خطایی رخ داد"
-    finally:
-        await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id, text=ack_text)
+        # چون از قبل (بی‌درنگ) به callback جواب داده شده، در صورت خطا یک پیام
+        # جدید برای اطلاع ادمین ارسال می‌شود تا کاربر بی‌خبر نماند.
+        if chat_id:
+            await tg_send(token, chat_id, "⚠️ خطایی هنگام پردازش رخ داد. دوباره تلاش کنید.")
 
 @app.post("/api/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
+async def telegram_webhook(secret: str, request: Request, background_tasks: BackgroundTasks):
+    """این endpoint باید در سریع‌ترین حالت ممکن به تلگرام پاسخ ۲۰۰ بدهد؛
+    وگرنه تلگرام همان آپدیت را دوباره ارسال می‌کند و پردازش تکراری/انباشته
+    باعث کند و هنگ به‌نظر رسیدن ربات می‌شود. به همین دلیل پردازش واقعی
+    (که شامل چند فراخوانی Redis و چند فراخوانی API تلگرام است) به یک
+    background task منتقل شده و اینجا فوراً {"ok": true} برمی‌گردد."""
     token = TG_CONFIG.get("token")
     if not token or not TG_CONFIG.get("enabled") or secret != tg_webhook_secret(token):
         raise HTTPException(status_code=404, detail="not found")
@@ -1320,27 +1432,43 @@ async def telegram_webhook(secret: str, request: Request):
     except Exception:
         return {"ok": True}
 
-    if "callback_query" in update:
-        await handle_telegram_callback(token, update["callback_query"])
+    if await _tg_is_duplicate_update(update.get("update_id")):
+        # آپدیت تکراری (retry تلگرام به‌خاطر تأخیر در پاسخ قبلی) — نادیده گرفته می‌شود
         return {"ok": True}
 
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return {"ok": True}
-
-    chat_id = message.get("chat", {}).get("id")
-    from_id = message.get("from", {}).get("id")
-    text = (message.get("text") or "").strip()
-
-    admin_id = TG_CONFIG.get("admin_id")
-    if not admin_id or str(from_id) != str(admin_id):
-        if chat_id:
-            await tg_send(token, chat_id, "⛔ شما اجازه‌ی استفاده از این ربات را ندارید.")
-        return {"ok": True}
-
-    await refresh_links_and_subs()
-    await handle_telegram_command(token, chat_id, text)
+    background_tasks.add_task(_process_telegram_update, token, update)
     return {"ok": True}
+
+async def _process_telegram_update(token: str, update: dict):
+    """پردازش واقعی آپدیت تلگرام، جدا از چرخه‌ی پاسخ‌دهی به وبهوک."""
+    t0 = time.monotonic()
+    try:
+        if "callback_query" in update:
+            await handle_telegram_callback(token, update["callback_query"])
+            return
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return
+
+        chat_id = message.get("chat", {}).get("id")
+        from_id = message.get("from", {}).get("id")
+        text = (message.get("text") or "").strip()
+
+        admin_id = TG_CONFIG.get("admin_id")
+        if not admin_id or str(from_id) != str(admin_id):
+            if chat_id:
+                await tg_send(token, chat_id, "⛔ شما اجازه‌ی استفاده از این ربات را ندارید.")
+            return
+
+        await refresh_links_and_subs()
+        await handle_telegram_command(token, chat_id, text)
+    except Exception as e:
+        logger.warning(f"Telegram update processing failed: {e}")
+    finally:
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if elapsed_ms > 3000:
+            logger.warning(f"Telegram update took {elapsed_ms:.0f}ms to process")
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
