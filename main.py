@@ -165,7 +165,8 @@ async def save_state():
                 await r.hset(REDIS_LINKS_KEY, mapping={uid: json.dumps(d, ensure_ascii=False) for uid, d in LINKS.items()})
             if SUBS:
                 await r.hset(REDIS_SUBS_KEY, mapping={sid: json.dumps(s, ensure_ascii=False) for sid, s in SUBS.items()})
-            await r.set(REDIS_PASSWORD_KEY, AUTH["password_hash"])
+            if AUTH["password_hash"] is not None:
+                await r.set(REDIS_PASSWORD_KEY, AUTH["password_hash"])
         except Exception as e:
             logger.warning(f"Could not save state to Redis: {e}")
 
@@ -236,7 +237,11 @@ SESSION_TTL = 60 * 60 * 24 * 365
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "2010"))}
+_admin_pw_env = os.environ.get("ADMIN_PASSWORD")
+# اگر ADMIN_PASSWORD صراحتاً ست شده باشد همان استفاده می‌شود؛ در غیر این صورت هیچ
+# رمز پیش‌فرضی وجود ندارد و کاربر باید در اولین ورود، خودش یک رمز انتخاب کند
+# (به همین دلیل password_hash در حالت اولیه None است، نه هش یک رمز ثابت).
+AUTH = {"password_hash": hash_password(_admin_pw_env) if _admin_pw_env else None}
 # نکته: روی Vercel هر request ممکن است به یک نمونه‌ی متفاوت برخورد کند، پس سشن‌ها
 # باید در Redis ذخیره شوند (نه در دیکشنری این حافظه)، وگرنه کاربر به‌طور نامنظم لاگ‌اوت می‌شود.
 SESSIONS: dict = {}  # fallback محلی وقتی Redis تنظیم نشده (برای تست لوکال)
@@ -677,6 +682,8 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
+    if AUTH["password_hash"] is None:
+        raise HTTPException(status_code=409, detail="ابتدا باید یک رمز عبور برای پنل انتخاب کنید")
     if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
@@ -695,7 +702,30 @@ async def api_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
+    return {
+        "authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE)),
+        "needs_setup": AUTH["password_hash"] is None,
+    }
+
+@app.post("/api/setup-password")
+async def api_setup_password(request: Request):
+    """فقط در اولین راه‌اندازی (وقتی هنوز هیچ رمزی ثبت نشده) قابل استفاده است؛
+    رمز انتخابی کاربر برای همیشه ذخیره می‌شود تا زمانی که خودش از طریق
+    change-password آن را عوض کند."""
+    if AUTH["password_hash"] is not None:
+        raise HTTPException(status_code=400, detail="رمز عبور قبلاً تنظیم شده است")
+    body = await request.json()
+    ip = client_ip(request)
+    pw = str(body.get("password", ""))
+    if len(pw) < 4:
+        raise HTTPException(status_code=400, detail="رمز عبور باید حداقل ۴ کاراکتر باشد")
+    AUTH["password_hash"] = hash_password(pw)
+    await save_state()
+    token = await create_session()
+    log_activity("auth", f"رمز عبور اولیه پنل تنظیم شد از {ip}", "ok")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    return resp
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, token=Depends(require_auth)):
