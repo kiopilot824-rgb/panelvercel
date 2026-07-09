@@ -121,6 +121,12 @@ async def load_state():
         pw_hash = await r.get(REDIS_PASSWORD_KEY)
         if pw_hash:
             AUTH["password_hash"] = pw_hash
+        tg_raw = await r.get(REDIS_TG_KEY)
+        if tg_raw:
+            try:
+                TG_CONFIG.update(json.loads(tg_raw))
+            except Exception:
+                pass
         logger.info(f"State loaded from Redis: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state from Redis: {e}")
@@ -186,6 +192,32 @@ async def redis_delete_sub(sub_id: str):
         except Exception as e:
             logger.warning(f"Could not delete sub {sub_id} from Redis: {e}")
 
+async def save_telegram_config():
+    r = await get_redis()
+    if not r:
+        return
+    try:
+        await r.set(REDIS_TG_KEY, json.dumps(TG_CONFIG, ensure_ascii=False))
+    except Exception as e:
+        logger.warning(f"Could not save telegram config to Redis: {e}")
+
+async def tg_call(token: str, method: str, **params):
+    """یک متد از Telegram Bot API را صدا می‌زند (sendMessage/getMe/setWebhook/...)."""
+    if not token or not http_client:
+        return None
+    try:
+        resp = await http_client.post(TG_API_BASE.format(token=token, method=method), json=params, timeout=15)
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"Telegram API call failed ({method}): {e}")
+        return None
+
+async def tg_send(token: str, chat_id, text: str):
+    await tg_call(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+
+def tg_webhook_secret(token: str) -> str:
+    return hashlib.sha256(f"tgwh:{token}:{CONFIG['secret']}".encode()).hexdigest()[:40]
+
 # ── In-memory state ───────────────────────────────────────────────────────────
 connections: dict = {}
 stats = {
@@ -246,6 +278,11 @@ AUTH = {"password_hash": hash_password(_admin_pw_env) if _admin_pw_env else None
 # باید در Redis ذخیره شوند (نه در دیکشنری این حافظه)، وگرنه کاربر به‌طور نامنظم لاگ‌اوت می‌شود.
 SESSIONS: dict = {}  # fallback محلی وقتی Redis تنظیم نشده (برای تست لوکال)
 SESSIONS_LOCK = asyncio.Lock()
+
+# ── Telegram Bot ────────────────────────────────────────────────────────────
+REDIS_TG_KEY = "x4g:telegram"
+TG_CONFIG: dict = {"token": None, "admin_id": None, "enabled": False, "bot_username": None}
+TG_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
 def _session_key(token: str) -> str:
     return f"x4g:session:{token}"
@@ -827,6 +864,483 @@ async def api_restore(request: Request, _=Depends(require_auth)):
     _default_link_created = True
     log_activity("system", f"داده‌های پنل از فایل بکاپ بازیابی شد ({len(new_links)} لینک، {len(new_subs)} گروه)", "warn")
     return {"ok": True, "links_count": len(new_links), "subs_count": len(new_subs)}
+
+# ── Telegram Bot ──────────────────────────────────────────────────────────────
+@app.get("/api/telegram/settings")
+async def get_telegram_settings(_=Depends(require_auth)):
+    token = TG_CONFIG.get("token")
+    masked = (token[:6] + "…" + token[-4:]) if token and len(token) > 12 else None
+    return {
+        "configured": bool(token),
+        "token_masked": masked,
+        "admin_id": TG_CONFIG.get("admin_id"),
+        "enabled": bool(TG_CONFIG.get("enabled")),
+        "bot_username": TG_CONFIG.get("bot_username"),
+    }
+
+@app.post("/api/telegram/settings")
+async def update_telegram_settings(request: Request, _=Depends(require_auth)):
+    body = await request.json()
+    token = str(body.get("token") or "").strip()
+    admin_id = str(body.get("admin_id") or "").strip()
+    enabled = bool(body.get("enabled"))
+
+    # اگر فیلد توکن خالی فرستاده شده ولی قبلاً یک توکن ذخیره شده، همان مقدار قبلی
+    # حفظ می‌شود (برای وقتی کاربر فقط می‌خواهد آیدی ادمین یا وضعیت را عوض کند).
+    if not token and TG_CONFIG.get("token"):
+        token = TG_CONFIG["token"]
+
+    if enabled:
+        if not token:
+            raise HTTPException(status_code=400, detail="برای فعال‌سازی، توکن ربات را وارد کنید")
+        if not admin_id or not admin_id.lstrip("-").isdigit():
+            raise HTTPException(status_code=400, detail="آیدی عددی ادمین معتبر نیست")
+
+    bot_username = TG_CONFIG.get("bot_username")
+    host = get_host()
+
+    if enabled:
+        me = await tg_call(token, "getMe")
+        if not me or not me.get("ok"):
+            raise HTTPException(status_code=400, detail="توکن ربات نامعتبر است یا تلگرام در دسترس نیست")
+        bot_username = me["result"].get("username")
+        secret = tg_webhook_secret(token)
+        wh = await tg_call(token, "setWebhook", url=f"https://{host}/api/telegram/webhook/{secret}", allowed_updates=["message", "callback_query"])
+        if not wh or not wh.get("ok"):
+            raise HTTPException(status_code=400, detail="ثبت webhook ناموفق بود؛ آدرس پنل باید https و در دسترس عموم باشد")
+    elif token:
+        await tg_call(token, "deleteWebhook")
+
+    TG_CONFIG["token"] = token or None
+    TG_CONFIG["admin_id"] = admin_id or None
+    TG_CONFIG["enabled"] = enabled
+    TG_CONFIG["bot_username"] = bot_username
+    await save_telegram_config()
+    log_activity("system", f"ربات تلگرام {'فعال' if enabled else 'غیرفعال'} شد", "ok" if enabled else "warn")
+    return {"ok": True, "bot_username": bot_username, "enabled": enabled}
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+# ── Telegram — Inline Keyboard UI ──────────────────────────────────────────
+TG_PAGE_SIZE = 6
+
+def tg_home_text() -> str:
+    return "🤖 <b>پنل مدیریت X4G</b>\nیکی از گزینه‌های زیر را انتخاب کنید 👇"
+
+def tg_main_menu_kb() -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "📊 وضعیت پنل", "callback_data": "status"}, {"text": "📋 کانفیگ‌ها", "callback_data": "links:0"}],
+            [{"text": "➕ کانفیگ جدید", "callback_data": "newcfg"}, {"text": "🌐 گروه‌های ساب", "callback_data": "subs:0"}],
+            [{"text": "🔄 رفرش", "callback_data": "menu"}, {"text": "ℹ️ راهنما", "callback_data": "help"}],
+        ]
+    }
+
+def tg_back_kb(extra_rows: list | None = None) -> dict:
+    rows = [list(r) for r in (extra_rows or [])]
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+def tg_help_text() -> str:
+    return (
+        "ℹ️ <b>راهنما</b>\n\n"
+        "از دکمه‌های شیشه‌ای زیر برای مدیریت پنل استفاده کنید:\n"
+        "📊 <b>وضعیت پنل</b> — آمار لحظه‌ای\n"
+        "📋 <b>کانفیگ‌ها</b> — لیست، فعال/غیرفعال، حذف\n"
+        "➕ <b>کانفیگ جدید</b> — انتخاب حجم و مدت با دکمه\n"
+        "🌐 <b>گروه‌های ساب</b> — مشاهده گروه‌های ساب\n\n"
+        "دستورات متنی هم قابل استفاده‌اند:\n"
+        "<code>/newconfig نام حجم_GB روز</code>\n"
+        "<code>/on uuid</code> · <code>/off uuid</code> · <code>/del uuid</code>"
+    )
+
+async def tg_status_text() -> str:
+    await refresh_links_and_subs()
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+    active = sum(1 for l in snap.values() if is_link_allowed(l))
+    return (
+        "📊 <b>وضعیت پنل</b>\n\n"
+        f"🔌 اتصالات فعال: {len(connections)}\n"
+        f"📈 ترافیک کل: {round(stats['total_bytes'] / (1024 ** 2), 2)} MB\n"
+        f"⏱ آپ‌تایم: {uptime()}\n"
+        f"🔗 کانفیگ‌ها: {len(snap)} (فعال: {active})\n"
+        f"🌐 گروه‌های ساب: {len(SUBS)}"
+    )
+
+async def tg_links_page(page: int):
+    async with LINKS_LOCK:
+        snap = dict(LINKS)
+    items = sorted(snap.items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True)
+    total = len(items)
+    pages = max(1, (total + TG_PAGE_SIZE - 1) // TG_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * TG_PAGE_SIZE:(page + 1) * TG_PAGE_SIZE]
+    rows = []
+    for uid, d in chunk:
+        status = "🟢" if is_link_allowed(d) else "🔴"
+        rows.append([{"text": f"{status} {d.get('label', '—')[:28]}", "callback_data": f"link:{uid}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"links:{page - 1}"})
+    if page < pages - 1:
+        nav.append({"text": "بعدی ▶️", "callback_data": f"links:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "➕ کانفیگ جدید", "callback_data": "newcfg"}])
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+    if not items:
+        text = "📋 هیچ کانفیگی وجود ندارد.\nبرای ساخت یکی، دکمه زیر را بزنید."
+    else:
+        text = f"📋 <b>کانفیگ‌ها</b> ({total} مورد) — صفحه {page + 1}/{pages}\nروی هرکدام بزنید برای مدیریت."
+    return text, {"inline_keyboard": rows}
+
+def tg_link_detail(uid: str):
+    d = LINKS.get(uid)
+    if not d:
+        return "این کانفیگ دیگر وجود ندارد.", tg_back_kb()
+    host = get_host()
+    allowed = is_link_allowed(d)
+    used = fmt_bytes(d.get("used_bytes", 0))
+    limit = "∞" if d.get("limit_bytes", 0) == 0 else fmt_bytes(d["limit_bytes"])
+    exp = d.get("expires_at")
+    exp_str = "نامحدود" if not exp else exp[:10]
+    vless = vless_link_for_link(d, uid, host)
+    text = (
+        f"{'🟢 فعال' if allowed else '🔴 غیرفعال'} <b>{d.get('label')}</b>\n"
+        f"UUID: <code>{uid}</code>\n"
+        f"مصرف: {used} / {limit}\n"
+        f"انقضا: {exp_str}\n\n"
+        f"<code>{vless}</code>"
+    )
+    toggle_btn = (
+        {"text": "🔴 غیرفعال کن", "callback_data": f"linkoff:{uid}"}
+        if d.get("active", True)
+        else {"text": "🟢 فعال کن", "callback_data": f"linkon:{uid}"}
+    )
+    rows = [
+        [toggle_btn, {"text": "🗑 حذف", "callback_data": f"linkdel:{uid}"}],
+        [{"text": "📋 لیست کانفیگ‌ها", "callback_data": "links:0"}],
+        [{"text": "🔙 بازگشت به منو", "callback_data": "menu"}],
+    ]
+    return text, {"inline_keyboard": rows}
+
+def tg_quota_kb() -> dict:
+    opts = [("نامحدود", "0"), ("500 MB", "0.5"), ("1 GB", "1"), ("5 GB", "5"), ("10 GB", "10"), ("50 GB", "50")]
+    rows, row = [], []
+    for label, val in opts:
+        row.append({"text": label, "callback_data": f"nq:{val}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+def tg_expiry_kb(gb: str) -> dict:
+    opts = [("نامحدود", "0"), ("۷ روز", "7"), ("۳۰ روز", "30"), ("۹۰ روز", "90")]
+    rows, row = [], []
+    for label, val in opts:
+        row.append({"text": label, "callback_data": f"ne:{gb}:{val}"})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+async def tg_create_quick_config(limit_gb: float, days: int, label: str | None = None):
+    limit_bytes = 0 if limit_gb <= 0 else parse_size_to_bytes(limit_gb, "GB")
+    expires_at = (datetime.now() + timedelta(days=days)).isoformat() if days > 0 else None
+    label = (label or f"تلگرام #{secrets.token_hex(2)}")[:60]
+    uid = generate_uuid()
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
+            "created_at": datetime.now().isoformat(), "active": True,
+            "expires_at": expires_at, "note": "ساخته‌شده از تلگرام", "is_default": False,
+            "sub_id": None, "protocol": DEFAULT_PROTOCOL, "fingerprint": DEFAULT_FINGERPRINT,
+            "alpn": "", "port": DEFAULT_PORT, "ip_limit": 0,
+        }
+        new_link = LINKS[uid]
+    await save_state()
+    log_activity("link", f"کانفیگ «{label}» از تلگرام ساخته شد", "ok")
+    return uid, new_link
+
+def tg_subs_page(page: int):
+    items = sorted(SUBS.items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True)
+    total = len(items)
+    pages = max(1, (total + TG_PAGE_SIZE - 1) // TG_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * TG_PAGE_SIZE:(page + 1) * TG_PAGE_SIZE]
+    rows = []
+    for sid, s in chunk:
+        rows.append([{"text": f"🌐 {s.get('name', '—')[:26]} ({len(s.get('link_ids', []))})", "callback_data": f"sub:{sid}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "◀️ قبلی", "callback_data": f"subs:{page - 1}"})
+    if page < pages - 1:
+        nav.append({"text": "بعدی ▶️", "callback_data": f"subs:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    rows.append([{"text": "🔙 بازگشت به منو", "callback_data": "menu"}])
+    if not items:
+        text = "🌐 هیچ گروه سابی وجود ندارد.\n(از داخل پنل وب می‌توانید گروه بسازید.)"
+    else:
+        text = f"🌐 <b>گروه‌های ساب</b> ({total} مورد) — صفحه {page + 1}/{pages}"
+    return text, {"inline_keyboard": rows}
+
+def tg_sub_detail(sid: str):
+    s = SUBS.get(sid)
+    if not s:
+        return "این گروه دیگر وجود ندارد.", tg_back_kb()
+    host = get_host()
+    link_ids = s.get("link_ids", [])
+    active_count = sum(1 for lid in link_ids if is_link_allowed(LINKS.get(lid)))
+    text = (
+        f"🌐 <b>{s.get('name')}</b>\n"
+        f"{s.get('desc') or ''}\n\n"
+        f"تعداد کانفیگ: {len(link_ids)} (فعال: {active_count})\n"
+        f"رمز: {'دارد 🔒' if s.get('password_hash') else 'ندارد'}\n\n"
+        f"لینک عمومی:\n<code>https://{host}/p/{s['uuid_key']}</code>"
+    )
+    rows = [
+        [{"text": "🌐 همه گروه‌ها", "callback_data": "subs:0"}],
+        [{"text": "🔙 بازگشت به منو", "callback_data": "menu"}],
+    ]
+    return text, {"inline_keyboard": rows}
+
+async def tg_edit_or_send(token: str, chat_id, message_id, text: str, kb: dict | None = None):
+    """ابتدا سعی می‌کند پیام قبلی را ویرایش کند (برای ناوبری روان با دکمه‌ها)؛
+    اگر ویرایش ممکن نبود (مثلاً پیام خیلی قدیمی یا اولین پیام)، پیام جدید می‌فرستد.
+    اگر محتوای جدید دقیقاً همان محتوای قبلی باشد (خطای Telegram not modified)،
+    از ارسال پیام تکراری صرف‌نظر می‌شود."""
+    if message_id:
+        r = await tg_call(token, "editMessageText", chat_id=chat_id, message_id=message_id,
+                           text=text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        if r and r.get("ok"):
+            return
+        if r and "not modified" in str(r.get("description", "")).lower():
+            return
+    await tg_call(token, "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                  reply_markup=kb, disable_web_page_preview=True)
+
+# ── Telegram — Text Commands (برای کاربران حرفه‌ای) ────────────────────────
+async def handle_telegram_command(token: str, chat_id, text: str):
+    if not text:
+        return
+    parts = text.strip().split()
+    cmd = parts[0].lower().split("@")[0]
+    args = parts[1:]
+
+    if cmd in ("/start", "/menu"):
+        await tg_call(token, "sendMessage", chat_id=chat_id, text=tg_home_text(),
+                      parse_mode="HTML", reply_markup=tg_main_menu_kb())
+        return
+
+    if cmd == "/help":
+        await tg_call(token, "sendMessage", chat_id=chat_id, text=tg_help_text(),
+                      parse_mode="HTML", reply_markup=tg_back_kb())
+        return
+
+    if cmd == "/status":
+        await tg_call(token, "sendMessage", chat_id=chat_id, text=await tg_status_text(),
+                      parse_mode="HTML", reply_markup=tg_back_kb([[{"text": "🔄 بروزرسانی", "callback_data": "status"}]]))
+        return
+
+    if cmd == "/list":
+        text_out, kb = await tg_links_page(0)
+        await tg_call(token, "sendMessage", chat_id=chat_id, text=text_out, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if cmd == "/newconfig":
+        label = args[0] if len(args) >= 1 else None
+        limit_gb = float(args[1]) if len(args) >= 2 and _is_number(args[1]) else 0
+        days = int(args[2]) if len(args) >= 3 and args[2].isdigit() else 0
+        uid, new_link = await tg_create_quick_config(limit_gb, days, label)
+        text_out, kb = tg_link_detail(uid)
+        await tg_call(token, "sendMessage", chat_id=chat_id, text="✅ کانفیگ جدید ساخته شد!\n\n" + text_out,
+                      parse_mode="HTML", reply_markup=kb)
+        return
+
+    if cmd in ("/on", "/off", "/del"):
+        if not args:
+            await tg_send(token, chat_id, "لطفاً UUID یا چند کاراکتر اول آن را وارد کنید.")
+            return
+        prefix = args[0]
+        async with LINKS_LOCK:
+            match = next((u for u in LINKS if u.startswith(prefix)), None)
+        if not match:
+            await tg_send(token, chat_id, "کانفیگی با این UUID پیدا نشد.")
+            return
+        if cmd == "/del":
+            async with LINKS_LOCK:
+                label = LINKS[match].get("label", match)
+                sub_id = LINKS[match].get("sub_id")
+                del LINKS[match]
+            if sub_id:
+                async with SUBS_LOCK:
+                    if sub_id in SUBS:
+                        ids = SUBS[sub_id].get("link_ids", [])
+                        if match in ids:
+                            ids.remove(match)
+            await redis_delete_link(match)
+            await save_state()
+            log_activity("link", f"کانفیگ «{label}» از تلگرام حذف شد", "err")
+            text_out, kb = await tg_links_page(0)
+            await tg_call(token, "sendMessage", chat_id=chat_id, text=f"🗑 کانفیگ «{label}» حذف شد.\n\n" + text_out,
+                          parse_mode="HTML", reply_markup=kb)
+        else:
+            active = cmd == "/on"
+            async with LINKS_LOCK:
+                LINKS[match]["active"] = active
+            await save_state()
+            log_activity("link", f"کانفیگ «{LINKS[match].get('label', match)}» از تلگرام {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
+            text_out, kb = tg_link_detail(match)
+            await tg_call(token, "sendMessage", chat_id=chat_id, text=text_out, parse_mode="HTML", reply_markup=kb)
+        return
+
+    await tg_call(token, "sendMessage", chat_id=chat_id, text="دستور نامعتبر. برای منو /menu را بفرستید.",
+                  parse_mode="HTML", reply_markup=tg_main_menu_kb())
+
+# ── Telegram — Callback Query (دکمه‌های شیشه‌ای) ───────────────────────────
+async def handle_telegram_callback(token: str, cq: dict):
+    data = cq.get("data") or ""
+    msg = cq.get("message") or {}
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+    from_id = cq.get("from", {}).get("id")
+    cq_id = cq.get("id")
+
+    admin_id = TG_CONFIG.get("admin_id")
+    if not admin_id or str(from_id) != str(admin_id):
+        await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id, text="⛔ دسترسی غیرمجاز", show_alert=True)
+        return
+
+    await refresh_links_and_subs()
+    ack_text = ""
+    try:
+        if data in ("menu", "back"):
+            await tg_edit_or_send(token, chat_id, message_id, tg_home_text(), tg_main_menu_kb())
+        elif data == "help":
+            await tg_edit_or_send(token, chat_id, message_id, tg_help_text(), tg_back_kb())
+        elif data == "status":
+            await tg_edit_or_send(token, chat_id, message_id, await tg_status_text(),
+                                   tg_back_kb([[{"text": "🔄 بروزرسانی", "callback_data": "status"}]]))
+        elif data.startswith("links:"):
+            page = int(data.split(":", 1)[1] or 0)
+            text_out, kb = await tg_links_page(page)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+        elif data.startswith("linkon:") or data.startswith("linkoff:"):
+            active = data.startswith("linkon:")
+            uid = data.split(":", 1)[1]
+            async with LINKS_LOCK:
+                exists = uid in LINKS
+                if exists:
+                    LINKS[uid]["active"] = active
+                    label = LINKS[uid].get("label", uid)
+            if exists:
+                await save_state()
+                log_activity("link", f"کانفیگ «{label}» از تلگرام {'فعال' if active else 'غیرفعال'} شد", "ok" if active else "warn")
+                ack_text = "🟢 فعال شد" if active else "🔴 غیرفعال شد"
+            text_out, kb = tg_link_detail(uid)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+        elif data.startswith("linkdelok:"):
+            uid = data.split(":", 1)[1]
+            async with LINKS_LOCK:
+                exists = uid in LINKS
+                label = LINKS[uid].get("label", uid) if exists else uid
+                sub_id = LINKS[uid].get("sub_id") if exists else None
+                if exists:
+                    del LINKS[uid]
+            if sub_id:
+                async with SUBS_LOCK:
+                    if sub_id in SUBS:
+                        ids = SUBS[sub_id].get("link_ids", [])
+                        if uid in ids:
+                            ids.remove(uid)
+            if exists:
+                await redis_delete_link(uid)
+                await save_state()
+                log_activity("link", f"کانفیگ «{label}» از تلگرام حذف شد", "err")
+                ack_text = "🗑 حذف شد"
+            text_out, kb = await tg_links_page(0)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+        elif data.startswith("linkdel:"):
+            uid = data.split(":", 1)[1]
+            label = LINKS.get(uid, {}).get("label", uid)
+            kb = {"inline_keyboard": [
+                [{"text": "✅ بله، حذف کن", "callback_data": f"linkdelok:{uid}"}, {"text": "❌ انصراف", "callback_data": f"link:{uid}"}],
+            ]}
+            await tg_edit_or_send(token, chat_id, message_id, f"⚠️ آیا از حذف «{label}» مطمئن هستید؟", kb)
+        elif data.startswith("link:"):
+            uid = data.split(":", 1)[1]
+            text_out, kb = tg_link_detail(uid)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+        elif data == "newcfg":
+            await tg_edit_or_send(token, chat_id, message_id, "📦 حجم مصرفی کانفیگ را انتخاب کنید:", tg_quota_kb())
+        elif data.startswith("nq:"):
+            gb = data.split(":", 1)[1]
+            gb_label = "نامحدود" if gb == "0" else f"{gb} GB"
+            await tg_edit_or_send(token, chat_id, message_id, f"📦 حجم: {gb_label}\n⏳ مدت اعتبار را انتخاب کنید:", tg_expiry_kb(gb))
+        elif data.startswith("ne:"):
+            _, gb, days = data.split(":")
+            uid, _new_link = await tg_create_quick_config(float(gb), int(days))
+            ack_text = "✅ کانفیگ ساخته شد"
+            text_out, kb = tg_link_detail(uid)
+            await tg_edit_or_send(token, chat_id, message_id, "✅ کانفیگ جدید ساخته شد!\n\n" + text_out, kb)
+        elif data.startswith("subs:"):
+            page = int(data.split(":", 1)[1] or 0)
+            text_out, kb = tg_subs_page(page)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+        elif data.startswith("sub:"):
+            sid = data.split(":", 1)[1]
+            text_out, kb = tg_sub_detail(sid)
+            await tg_edit_or_send(token, chat_id, message_id, text_out, kb)
+    except Exception as e:
+        logger.warning(f"Telegram callback error: {e}")
+        ack_text = "خطایی رخ داد"
+    finally:
+        await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id, text=ack_text)
+
+@app.post("/api/telegram/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    token = TG_CONFIG.get("token")
+    if not token or not TG_CONFIG.get("enabled") or secret != tg_webhook_secret(token):
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    if "callback_query" in update:
+        await handle_telegram_callback(token, update["callback_query"])
+        return {"ok": True}
+
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat_id = message.get("chat", {}).get("id")
+    from_id = message.get("from", {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    admin_id = TG_CONFIG.get("admin_id")
+    if not admin_id or str(from_id) != str(admin_id):
+        if chat_id:
+            await tg_send(token, chat_id, "⛔ شما اجازه‌ی استفاده از این ربات را ندارید.")
+        return {"ok": True}
+
+    await refresh_links_and_subs()
+    await handle_telegram_command(token, chat_id, text)
+    return {"ok": True}
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
