@@ -1267,6 +1267,25 @@ a{color:inherit;text-decoration:none}
         <button class="pw-submit" onclick="changePw()"><i class="ti ti-shield-check"></i> ذخیره رمز جدید</button>
       </div>
     </div>
+    <div class="srv-panel" style="grid-column:1/-1">
+      <div class="srv-hero">
+        <div class="srv-hero-icon"><i class="ti ti-database-export"></i></div>
+        <div class="srv-hero-text">
+          <div class="srv-hero-domain">پشتیبان‌گیری و بازیابی داده‌ها</div>
+          <div class="srv-hero-sub"><span class="dot dg pulse"></span> بکاپ کامل از کانفیگ‌ها، گروه‌های ساب و رمز عبور</div>
+        </div>
+      </div>
+      <div class="srv-tiles">
+        <div class="srv-tile" style="grid-column:1/-1;flex-direction:column;align-items:stretch;gap:12px">
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn btn-p" onclick="downloadBackup()" id="backup-btn"><i class="ti ti-download"></i> دانلود بکاپ کامل</button>
+            <button class="btn btn-amber" onclick="document.getElementById('restore-file-input').click()"><i class="ti ti-upload"></i> بازیابی از فایل بکاپ</button>
+            <input type="file" id="restore-file-input" accept="application/json,.json" style="display:none" onchange="restoreBackup(this.files[0]);this.value=''">
+          </div>
+          <div class="srv-tile-val" style="font-size:11px;color:var(--t2)"><i class="ti ti-info-circle"></i> بازیابی، تمام داده‌های فعلی پنل (کانفیگ‌ها و گروه‌های ساب) را با محتوای فایل بکاپ جایگزین می‌کند.</div>
+        </div>
+      </div>
+    </div>
   </div>
 </section>
 <section class="pg" id="pg-support">
@@ -1823,6 +1842,39 @@ async function changePw(){
     if(!r.ok)throw new Error(d.detail||'خطا');
     toast('رمز تغییر کرد ✓','ok');
     ['cp-cur','cp-new','cp-cf'].forEach(id=>document.getElementById(id).value='');
+  }catch(e){toast('✗ '+e.message,'err')}
+}
+async function downloadBackup(){
+  const btn=document.getElementById('backup-btn');
+  const orig=btn.innerHTML;
+  btn.disabled=true;btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> در حال دریافت...';
+  try{
+    const r=await authF('/api/backup');
+    if(!r.ok)throw new Error('خطا در دریافت بکاپ');
+    const blob=await r.blob();
+    const cd=r.headers.get('Content-Disposition')||'';
+    const m=cd.match(/filename="?([^"]+)"?/);
+    const filename=m?m[1]:('x4g-backup-'+Date.now()+'.json');
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download=filename;document.body.appendChild(a);a.click();
+    a.remove();URL.revokeObjectURL(url);
+    toast('بکاپ با موفقیت دانلود شد ✓','ok');
+  }catch(e){toast('✗ '+e.message,'err')}
+  finally{btn.disabled=false;btn.innerHTML=orig;}
+}
+async function restoreBackup(file){
+  if(!file)return;
+  if(!confirm('تمام داده‌های فعلی پنل (کانفیگ‌ها و گروه‌های ساب) با محتوای این فایل جایگزین می‌شود. ادامه می‌دهید؟'))return;
+  try{
+    const text=await file.text();
+    let parsed;
+    try{parsed=JSON.parse(text)}catch(e){throw new Error('فایل انتخابی JSON معتبر نیست')}
+    const r=await authF('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(parsed)});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(d.detail||'خطا در بازیابی داده‌ها');
+    toast(`بازیابی انجام شد ✓ (${d.links_count??0} لینک، ${d.subs_count??0} گروه)`,'ok');
+    refreshAll();
   }catch(e){toast('✗ '+e.message,'err')}
 }
 function togglePwField(id,btn){
