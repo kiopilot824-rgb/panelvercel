@@ -1267,50 +1267,6 @@ a{color:inherit;text-decoration:none}
         <button class="pw-submit" onclick="changePw()"><i class="ti ti-shield-check"></i> ذخیره رمز جدید</button>
       </div>
     </div>
-    <div class="pw-panel" style="grid-column:1/-1">
-      <div class="pw-hero">
-        <div class="pw-hero-icon" style="background:linear-gradient(135deg,#29A9EA,#229ED9)"><i class="ti ti-brand-telegram"></i></div>
-        <div class="pw-hero-text">
-          <div class="pw-hero-title">ربات مدیریت تلگرام</div>
-          <div class="pw-hero-sub" id="tg-status-sub">با اتصال ربات، از داخل تلگرام هم می‌توانید پنل را مدیریت و کانفیگ بسازید</div>
-        </div>
-        <button class="tog" id="tg-toggle" onclick="tgToggleEnabled()" title="فعال/غیرفعال ربات"></button>
-      </div>
-      <div class="pw-body">
-        <div class="pw-field">
-          <label>توکن ربات (از @BotFather)</label>
-          <input class="pw-input" type="text" id="tg-token" placeholder="مثلاً 123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="font-family:monospace;padding-left:14px">
-        </div>
-        <div class="pw-field" style="margin-bottom:18px">
-          <label>آیدی عددی ادمین (از @userinfobot)</label>
-          <input class="pw-input" type="text" inputmode="numeric" id="tg-admin-id" placeholder="مثلاً 123456789" style="padding-left:14px">
-        </div>
-        <div id="tg-bot-info" style="display:none;font-size:11px;color:var(--t2);margin-bottom:14px;padding:10px 12px;background:var(--accent-d);border-radius:10px">
-          <i class="ti ti-circle-check" style="color:var(--green)"></i> متصل به <b id="tg-bot-username">—</b> · برای شروع در تلگرام دستور <code>/start</code> را بفرستید
-        </div>
-        <button class="pw-submit" onclick="saveTelegramSettings()" id="tg-save-btn" style="background:linear-gradient(135deg,#29A9EA,#229ED9)"><i class="ti ti-device-floppy"></i> ذخیره و اتصال ربات</button>
-        <div class="srv-tile-val" style="font-size:11px;color:var(--t2);margin-top:12px"><i class="ti ti-info-circle"></i> توکن ربات را از <b>@BotFather</b> و آیدی عددی خودتان را از <b>@userinfobot</b> در تلگرام بگیرید. بعد از اتصال، با فرستادن <code>/start</code> یک منوی دکمه‌ای برای مدیریت کامل پنل (وضعیت، لیست و مدیریت کانفیگ‌ها، ساخت کانفیگ جدید با انتخاب حجم/مدت، گروه‌های ساب) نمایش داده می‌شود.</div>
-      </div>
-    </div>
-    <div class="srv-panel" style="grid-column:1/-1">
-      <div class="srv-hero">
-        <div class="srv-hero-icon"><i class="ti ti-database-export"></i></div>
-        <div class="srv-hero-text">
-          <div class="srv-hero-domain">پشتیبان‌گیری و بازیابی داده‌ها</div>
-          <div class="srv-hero-sub"><span class="dot dg pulse"></span> بکاپ کامل از کانفیگ‌ها، گروه‌های ساب و رمز عبور</div>
-        </div>
-      </div>
-      <div class="srv-tiles">
-        <div class="srv-tile" style="grid-column:1/-1;flex-direction:column;align-items:stretch;gap:12px">
-          <div style="display:flex;gap:10px;flex-wrap:wrap">
-            <button class="btn btn-p" onclick="downloadBackup()" id="backup-btn"><i class="ti ti-download"></i> دانلود بکاپ کامل</button>
-            <button class="btn btn-amber" onclick="document.getElementById('restore-file-input').click()"><i class="ti ti-upload"></i> بازیابی از فایل بکاپ</button>
-            <input type="file" id="restore-file-input" accept="application/json,.json" style="display:none" onchange="restoreBackup(this.files[0]);this.value=''">
-          </div>
-          <div class="srv-tile-val" style="font-size:11px;color:var(--t2)"><i class="ti ti-info-circle"></i> بازیابی، تمام داده‌های فعلی پنل (کانفیگ‌ها و گروه‌های ساب) را با محتوای فایل بکاپ جایگزین می‌کند.</div>
-        </div>
-      </div>
-    </div>
   </div>
 </section>
 <section class="pg" id="pg-support">
@@ -1421,7 +1377,7 @@ overlay.addEventListener('click',closeSb);
 function navTo(name){
   document.querySelectorAll('.nav-it').forEach(n=>n.classList.toggle('on',n.dataset.pg===name));
   document.querySelectorAll('.pg').forEach(p=>p.classList.toggle('on',p.id==='pg-'+name));
-  const loaders={links:loadLinks,connections:loadConns,errors:loadErrs,subscriptions:loadSubsPage,subgroups:loadSubs,logs:loadActivity,settings:loadTelegramSettings};
+  const loaders={links:loadLinks,connections:loadConns,errors:loadErrs,subscriptions:loadSubsPage,subgroups:loadSubs,logs:loadActivity};
   if(loaders[name])loaders[name]();
   closeSb();window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -1868,78 +1824,6 @@ async function changePw(){
     toast('رمز تغییر کرد ✓','ok');
     ['cp-cur','cp-new','cp-cf'].forEach(id=>document.getElementById(id).value='');
   }catch(e){toast('✗ '+e.message,'err')}
-}
-async function downloadBackup(){
-  const btn=document.getElementById('backup-btn');
-  const orig=btn.innerHTML;
-  btn.disabled=true;btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> در حال دریافت...';
-  try{
-    const r=await authF('/api/backup');
-    if(!r.ok)throw new Error('خطا در دریافت بکاپ');
-    const blob=await r.blob();
-    const cd=r.headers.get('Content-Disposition')||'';
-    const m=cd.match(/filename="?([^"]+)"?/);
-    const filename=m?m[1]:('x4g-backup-'+Date.now()+'.json');
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;a.download=filename;document.body.appendChild(a);a.click();
-    a.remove();URL.revokeObjectURL(url);
-    toast('بکاپ با موفقیت دانلود شد ✓','ok');
-  }catch(e){toast('✗ '+e.message,'err')}
-  finally{btn.disabled=false;btn.innerHTML=orig;}
-}
-async function restoreBackup(file){
-  if(!file)return;
-  if(!confirm('تمام داده‌های فعلی پنل (کانفیگ‌ها و گروه‌های ساب) با محتوای این فایل جایگزین می‌شود. ادامه می‌دهید؟'))return;
-  try{
-    const text=await file.text();
-    let parsed;
-    try{parsed=JSON.parse(text)}catch(e){throw new Error('فایل انتخابی JSON معتبر نیست')}
-    const r=await authF('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(parsed)});
-    const d=await r.json().catch(()=>({}));
-    if(!r.ok)throw new Error(d.detail||'خطا در بازیابی داده‌ها');
-    toast(`بازیابی انجام شد ✓ (${d.links_count??0} لینک، ${d.subs_count??0} گروه)`,'ok');
-    refreshAll();
-  }catch(e){toast('✗ '+e.message,'err')}
-}
-let tgLoaded=false;
-function tgToggleEnabled(){document.getElementById('tg-toggle').classList.toggle('on')}
-async function loadTelegramSettings(){
-  try{
-    const r=await authF('/api/telegram/settings');
-    const d=await r.json();
-    document.getElementById('tg-admin-id').value=d.admin_id||'';
-    const tokenInput=document.getElementById('tg-token');
-    tokenInput.value='';
-    tokenInput.placeholder=d.token_masked?('توکن فعلی: '+d.token_masked+' — برای تغییر، توکن جدید وارد کنید'):'مثلاً 123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxx';
-    document.getElementById('tg-toggle').classList.toggle('on',!!d.enabled);
-    const info=document.getElementById('tg-bot-info');
-    if(d.bot_username&&d.enabled){
-      info.style.display='block';
-      document.getElementById('tg-bot-username').textContent='@'+d.bot_username;
-    }else{
-      info.style.display='none';
-    }
-    tgLoaded=true;
-  }catch(e){}
-}
-async function saveTelegramSettings(){
-  const btn=document.getElementById('tg-save-btn');
-  const orig=btn.innerHTML;
-  const token=document.getElementById('tg-token').value.trim();
-  const adminId=document.getElementById('tg-admin-id').value.trim();
-  const enabled=document.getElementById('tg-toggle').classList.contains('on');
-  if(enabled&&!adminId){toast('آیدی عددی ادمین را وارد کنید','err');return}
-  if(enabled&&adminId&&!/^-?\d+$/.test(adminId)){toast('آیدی عددی ادمین باید فقط عدد باشد','err');return}
-  btn.disabled=true;btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> در حال اتصال...';
-  try{
-    const r=await authF('/api/telegram/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token,admin_id:adminId,enabled})});
-    const d=await r.json().catch(()=>({}));
-    if(!r.ok)throw new Error(d.detail||'خطا در ذخیره تنظیمات ربات');
-    toast(enabled?'ربات تلگرام متصل و فعال شد ✓':'تنظیمات ذخیره شد','ok');
-    await loadTelegramSettings();
-  }catch(e){toast('✗ '+e.message,'err')}
-  finally{btn.disabled=false;btn.innerHTML=orig;}
 }
 function togglePwField(id,btn){
   const inp=document.getElementById(id);
