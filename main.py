@@ -62,13 +62,21 @@ REDIS_LINKS_KEY = "x4g:links"             # Hash: field=uid    -> json لینک
 REDIS_SUBS_KEY = "x4g:subs"               # Hash: field=sub_id -> json گروه
 REDIS_PASSWORD_KEY = "x4g:password_hash"  # String
 REDIS_STATE_KEY_LEGACY = "x4g:state"      # کلید قدیمی (برای مهاجرت خودکار یک‌باره)
+REDIS_DEFAULT_LINK_SEEDED_KEY = "x4g:default_link_seeded"  # یک‌بار-برای-همیشه: اگه ست باشه، دیگه لینک پیش‌فرض هیچ‌وقت خودکار ساخته نمی‌شه
 SAVE_LOCK = asyncio.Lock()
 redis_client = None  # در startup مقداردهی می‌شود
+REDIS_CONNECTED = False  # برای نمایش وضعیت در پنل (اگه False باشه یعنی تغییرات پایدار نمی‌مونن)
 
 async def get_redis():
-    global redis_client
+    global redis_client, REDIS_CONNECTED
     if redis_client is None and REDIS_URL and aioredis:
         redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        try:
+            await redis_client.ping()
+            REDIS_CONNECTED = True
+        except Exception as e:
+            logger.warning(f"Redis ping failed ({e}); تغییرات پایدار نخواهند ماند.")
+            REDIS_CONNECTED = False
     return redis_client
 
 async def _migrate_legacy_blob_if_needed(r):
@@ -452,14 +460,41 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "نامشخص"
 
 # ── Default link ──────────────────────────────────────────────────────────────
-_default_link_created = False
+# باگ قبلی: این تابع روی هر بار باز شدن /dashboard اجرا می‌شد و چون فلگ
+# _default_link_created فقط در حافظه‌ی همون instance بود (نه در Redis)، با هر
+# cold start جدید (که روی Vercel/serverless خیلی زیاد پیش میاد) دوباره False
+# می‌شد؛ در نتیجه اگه کاربر لینک پیش‌فرض رو حذف کرده بود، همون لینک با همون UUID
+# ثابت (چون از هش رمز سرور ساخته می‌شد) دوباره و بازم فعال (active=True) از نو
+# ساخته می‌شد — دقیقاً همون «بعد از حذف بلافاصله برمی‌گرده» و «غیرفعال‌کردن هم
+# خودش دوباره فعال می‌شه» (چون کل state از صفر بازسازی می‌شد).
+#
+# راه‌حل: به‌جای یک فلگ ناپایدارِ حافظه‌ای، از یک مارکر دائمی در Redis استفاده
+# می‌کنیم که فقط یک‌بار در طول عمر پنل ست می‌شه. اگه این مارکر وجود داشته باشه،
+# یعنی لینک پیش‌فرض قبلاً (روزی) ساخته شده و دیگه هیچ‌وقت خودکار بازسازی نمی‌شه؛
+# حتی اگه کاربر عمداً حذفش کرده باشه.
+_default_link_created = False  # fallback فقط برای حالتی که اصلاً Redis نیست
 
 async def ensure_default_link():
     global _default_link_created
-    if _default_link_created:
-        return
+    r = await get_redis()
+
+    if r:
+        try:
+            seeded = await r.get(REDIS_DEFAULT_LINK_SEEDED_KEY)
+        except Exception as e:
+            logger.warning(f"Could not read default-link marker: {e}")
+            seeded = None
+        if seeded:
+            return  # قبلاً (روزی) ساخته شده؛ حتی اگه الان کاربر حذفش کرده باشه دوباره نساز
+    else:
+        # بدون Redis: هیچ تضمینی برای پایداری بین instanceها نیست، فقط جلوی
+        # ساخت تکراری در همین یک instance رو می‌گیریم.
+        if _default_link_created:
+            return
+
     async with LINKS_LOCK:
-        if not any(l.get("is_default") for l in LINKS.values()):
+        has_default = any(l.get("is_default") for l in LINKS.values())
+        if not has_default:
             uid = hashlib.sha256(f"default{CONFIG['secret']}".encode()).hexdigest()
             uid = f"{uid[:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:32]}"
             if uid not in LINKS:
@@ -480,7 +515,15 @@ async def ensure_default_link():
                     "ip_limit": 0,
                 }
                 await save_state()
-        _default_link_created = True
+
+    # مارکر رو همیشه ست کن (چه همین الان ساخته باشیم چه از قبل موجود بوده)
+    # تا از این به بعد، حتی اگه کاربر لینک رو حذف کنه، دیگه هیچ‌وقت خودکار برنگرده.
+    if r:
+        try:
+            await r.set(REDIS_DEFAULT_LINK_SEEDED_KEY, "1")
+        except Exception as e:
+            logger.warning(f"Could not persist default-link marker: {e}")
+    _default_link_created = True
 
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
@@ -706,6 +749,15 @@ async def api_me(request: Request):
         "authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE)),
         "needs_setup": AUTH["password_hash"] is None,
     }
+
+@app.get("/api/system/status")
+async def api_system_status(_=Depends(require_auth)):
+    """وضعیت اتصال Redis رو برمی‌گردونه. اگه وصل نباشه، یعنی هیچ تغییری
+    (حذف/غیرفعال‌کردن/ساخت کانفیگ) بین دو request پایدار نمی‌مونه و ممکنه
+    با هر cold start به حالت اولیه برگردد — این دقیقاً علت باگ «کانفیگ حذف‌شده
+    برمی‌گرده» روی محیط‌های serverless بدون Redis تنظیم‌شده است."""
+    await get_redis()
+    return {"redis_configured": bool(REDIS_URL), "redis_connected": REDIS_CONNECTED}
 
 @app.post("/api/setup-password")
 async def api_setup_password(request: Request):
