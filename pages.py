@@ -856,6 +856,10 @@ a{color:inherit;text-decoration:none}
   </div>
 </aside>
 <main class="main">
+<div id="redis-warn" style="display:none;margin-bottom:14px;padding:12px 16px;border-radius:12px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#ef4444;font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:8px">
+  <i class="ti ti-alert-triangle"></i>
+  <span>اتصال به Redis برقرار نیست؛ تغییرات (حذف/غیرفعال‌کردن/ساخت کانفیگ) ممکن است بعد از ری‌استارت سرور از بین بروند یا خودشان برگردند. لطفاً متغیر محیطی REDIS_URL را تنظیم کنید.</span>
+</div>
 <section class="pg on" id="pg-overview">
   <div class="topbar">
     <div><div class="tb-title"><i class="ti ti-layout-dashboard"></i> داشبورد</div><div class="tb-sub" id="last-upd">در حال بارگذاری...</div></div>
@@ -1353,6 +1357,7 @@ function protoBadge(p){
   return `<span class="proto-chip ${v[1]}">${v[0]}</span>`;
 }
 async function checkAuth(){try{const r=await fetch('/api/me');const d=await r.json();if(!d.authenticated)location.href='/login';}catch(e){location.href='/login'}}
+async function checkRedisStatus(){try{const r=await fetch('/api/system/status');const d=await r.json();const el=document.getElementById('redis-warn');if(el)el.style.display=d.redis_connected?'none':'flex';}catch(e){}}
 async function logout(){try{await fetch('/api/logout',{method:'POST'})}catch(e){}location.href='/login'}
 document.getElementById('logout-btn').addEventListener('click',logout);
 async function authF(url,opts={}){
@@ -1983,6 +1988,7 @@ function wsSend(){const m=document.getElementById('ws-msg').value;if(!m||!ws||ws
 function wsDisc(){if(ws)ws.close()}
 document.addEventListener('DOMContentLoaded',async()=>{
   await checkAuth();
+  checkRedisStatus();
   initCharts();
   document.getElementById('set-host').textContent=location.host;
   document.getElementById('sub-all-url')&&(document.getElementById('sub-all-url').textContent=location.protocol+'//'+location.host+'/sub-all');
