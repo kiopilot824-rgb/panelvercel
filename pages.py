@@ -63,39 +63,66 @@ input:focus+.ic{color:var(--accent)}
       <div class="brand-img"><img src="data:image/png;base64,__LOGO_B64__" alt="X4G"></div>
       <div><div class="brand-name">X4G</div><div class="brand-sub">v9.2</div></div>
     </div>
-    <h1>ورود به پنل</h1>
-    <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
+    <h1 id="title">ورود به پنل</h1>
+    <p class="sub" id="subtitle">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
     <div class="err" id="err"><i class="ti ti-alert-circle"></i><span id="err-text"></span></div>
-    <div class="hint">
-      <span class="hint-label">رمز پیش‌فرض سیستم</span>
-      <span class="hint-val" onclick="document.getElementById('pw').value='2010';document.getElementById('pw').focus()">2010</span>
-    </div>
     <form id="form">
       <div class="field">
-        <label>رمز عبور</label>
+        <label id="pw-label">رمز عبور</label>
         <div class="inp-wrap">
           <input type="password" id="pw" placeholder="رمز عبور را وارد کنید" autofocus required>
           <i class="ti ti-lock ic"></i>
         </div>
       </div>
-      <button class="btn" type="submit" id="btn"><i class="ti ti-login-2"></i> ورود به داشبورد</button>
+      <div class="field" id="pw2-field" style="display:none">
+        <label>تکرار رمز عبور</label>
+        <div class="inp-wrap">
+          <input type="password" id="pw2" placeholder="رمز عبور را دوباره وارد کنید">
+          <i class="ti ti-lock ic"></i>
+        </div>
+      </div>
+      <button class="btn" type="submit" id="btn"><i class="ti ti-login-2"></i> <span id="btn-text">ورود به داشبورد</span></button>
     </form>
     <div class="footer">پشتیبانی <a href="https://t.me/Farajian2004f" target="_blank"><i class="ti ti-brand-telegram"></i>@Farajian2004f</a></div>
   </div>
 </div>
 <script>
+let SETUP_MODE=false;
+(async()=>{
+  try{
+    const r=await fetch('/api/me');
+    const d=await r.json();
+    if(d.needs_setup){
+      SETUP_MODE=true;
+      document.getElementById('title').textContent='تنظیم رمز عبور پنل';
+      document.getElementById('subtitle').textContent='این اولین راه‌اندازی پنل است، یک رمز عبور برای خودتان انتخاب کنید';
+      document.getElementById('pw-label').textContent='رمز عبور جدید';
+      document.getElementById('pw').placeholder='یک رمز عبور انتخاب کنید';
+      document.getElementById('pw2-field').style.display='block';
+      document.getElementById('btn-text').textContent='ثبت رمز عبور و ورود';
+    }
+  }catch(e){}
+})();
 document.getElementById('form').addEventListener('submit',async e=>{
   e.preventDefault();
   const btn=document.getElementById('btn'),err=document.getElementById('err'),et=document.getElementById('err-text');
-  err.classList.remove('show');btn.disabled=true;
-  btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> در حال ورود...';
+  err.classList.remove('show');
+  const pw=document.getElementById('pw').value;
+  if(SETUP_MODE){
+    const pw2=document.getElementById('pw2').value;
+    if(pw.length<4){et.textContent='رمز عبور باید حداقل ۴ کاراکتر باشد';err.classList.add('show');return;}
+    if(pw!==pw2){et.textContent='رمز عبور و تکرار آن یکسان نیستند';err.classList.add('show');return;}
+  }
+  btn.disabled=true;
+  btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> '+(SETUP_MODE?'در حال ثبت...':'در حال ورود...');
   try{
-    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
+    const url=SETUP_MODE?'/api/setup-password':'/api/login';
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
     if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'خطا');}
     location.href='/dashboard';
   }catch(e){
     et.textContent=e.message;err.classList.add('show');
-    btn.disabled=false;btn.innerHTML='<i class="ti ti-login-2"></i> ورود به داشبورد';
+    btn.disabled=false;btn.innerHTML='<i class="ti ti-login-2"></i> <span id="btn-text">'+(SETUP_MODE?'ثبت رمز عبور و ورود':'ورود به داشبورد')+'</span>';
   }
 });
 </script>
