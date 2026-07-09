@@ -749,6 +749,85 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
     return {"ok": True}
 
+# ── Backup / Restore ──────────────────────────────────────────────────────────
+BACKUP_VERSION = 1
+
+@app.get("/api/backup")
+async def api_backup(_=Depends(require_auth)):
+    """یک بکاپ کامل JSON از تمام داده‌های پنل (لینک‌ها، گروه‌های ساب و هش رمز عبور)
+    برمی‌گرداند تا کاربر بتواند آن را دانلود و بعداً بازیابی کند."""
+    await refresh_links_and_subs()
+    async with LINKS_LOCK:
+        links_snap = dict(LINKS)
+    async with SUBS_LOCK:
+        subs_snap = dict(SUBS)
+    payload = {
+        "app": "X4G",
+        "backup_version": BACKUP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "host": get_host(),
+        "data": {
+            "links": links_snap,
+            "subs": subs_snap,
+            "password_hash": AUTH["password_hash"],
+        },
+    }
+    filename = f"x4g-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    log_activity("system", "یک بکاپ کامل از داده‌های پنل گرفته شد", "ok")
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@app.post("/api/restore")
+async def api_restore(request: Request, _=Depends(require_auth)):
+    """داده‌های پنل (لینک‌ها/گروه‌های ساب/رمز عبور) را از یک فایل بکاپ که قبلاً با
+    /api/backup گرفته شده بازیابی می‌کند. این عملیات تمام داده‌های فعلی را
+    جایگزین می‌کند (هم در حافظه و هم در Redis)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="فایل بکاپ نامعتبر است (JSON نیست)")
+
+    data = body.get("data") if isinstance(body, dict) and "data" in body else body
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="ساختار فایل بکاپ نامعتبر است")
+
+    new_links = data.get("links")
+    new_subs = data.get("subs")
+    new_pw_hash = data.get("password_hash")
+
+    if not isinstance(new_links, dict) or not isinstance(new_subs, dict):
+        raise HTTPException(status_code=400, detail="فایل بکاپ فاقد اطلاعات لینک‌ها/گروه‌هاست")
+
+    r = await get_redis()
+
+    async with LINKS_LOCK:
+        LINKS.clear()
+        LINKS.update(new_links)
+    async with SUBS_LOCK:
+        SUBS.clear()
+        SUBS.update(new_subs)
+    if new_pw_hash:
+        AUTH["password_hash"] = new_pw_hash
+
+    # اول کل Hashهای قدیمی روی Redis پاک می‌شوند تا رکوردهایی که در بکاپ جدید
+    # نیستند باقی نمانند، سپس داده‌ی تازه نوشته می‌شود.
+    if r:
+        try:
+            await r.delete(REDIS_LINKS_KEY)
+            await r.delete(REDIS_SUBS_KEY)
+        except Exception as e:
+            logger.warning(f"Could not clear old state before restore: {e}")
+
+    await save_state()
+    global _default_link_created
+    _default_link_created = True
+    log_activity("system", f"داده‌های پنل از فایل بکاپ بازیابی شد ({len(new_links)} لینک، {len(new_subs)} گروه)", "warn")
+    return {"ok": True, "links_count": len(new_links), "subs_count": len(new_subs)}
+
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
