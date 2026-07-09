@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from collections import deque, defaultdict
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -1323,12 +1323,15 @@ async def handle_telegram_callback(token: str, cq: dict):
         await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id, text="⛔ دسترسی غیرمجاز", show_alert=True)
         return
 
-    # نکته‌ی مهم برای رفع «هنگ» دکمه‌ها: تا وقتی answerCallbackQuery نرسد،
-    # تلگرام چرخ‌وفلک لودینگ را روی دکمه نگه می‌دارد. قبلاً این تایید در
-    # انتهای پردازش (بعد از refresh از Redis و ویرایش پیام) ارسال می‌شد که
-    # حس هنگ‌کردن ایجاد می‌کرد. حالا بی‌درنگ و بدون انتظار ارسال می‌شود و
-    # ادامه‌ی پردازش (رفرش/ویرایش پیام) موازی با آن انجام می‌شود.
-    asyncio.create_task(tg_call(token, "answerCallbackQuery", callback_query_id=cq_id))
+    # نکته‌ی مهم برای رفع «هنگ‌بودن» دکمه‌ها: تا وقتی answerCallbackQuery نرسد،
+    # تلگرام چرخ‌وفلک لودینگ را روی دکمه نگه می‌دارد. برای همین این تایید
+    # همین اول (قبل از هر کار دیگری) ارسال می‌شود، نه انتهای پردازش.
+    # نکته‌ی مهم‌تر: این await باید کامل تمام شود (نه fire-and-forget با
+    # create_task)، وگرنه روی هاستینگ سرورلس (مثل Vercel) که تابع بلافاصله
+    # بعد از پاسخ HTTP فریز می‌شود، عملیات‌های بعدی (حذف/فعال-غیرفعال کردن
+    # کانفیگ) هرگز به Redis نمی‌رسیدند — همان چیزی که باعث می‌شد حذف/غیرفعال‌سازی
+    # در ظاهر انجام شود ولی واقعاً ثبت نشود.
+    await tg_call(token, "answerCallbackQuery", callback_query_id=cq_id)
 
     await refresh_links_and_subs()
     ack_text = ""
@@ -1418,12 +1421,15 @@ async def handle_telegram_callback(token: str, cq: dict):
             await tg_send(token, chat_id, "⚠️ خطایی هنگام پردازش رخ داد. دوباره تلاش کنید.")
 
 @app.post("/api/telegram/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request, background_tasks: BackgroundTasks):
-    """این endpoint باید در سریع‌ترین حالت ممکن به تلگرام پاسخ ۲۰۰ بدهد؛
-    وگرنه تلگرام همان آپدیت را دوباره ارسال می‌کند و پردازش تکراری/انباشته
-    باعث کند و هنگ به‌نظر رسیدن ربات می‌شود. به همین دلیل پردازش واقعی
-    (که شامل چند فراخوانی Redis و چند فراخوانی API تلگرام است) به یک
-    background task منتقل شده و اینجا فوراً {"ok": true} برمی‌گردد."""
+async def telegram_webhook(secret: str, request: Request):
+    """این endpoint سعی می‌کند سریع پاسخ بدهد، اما پردازش واقعی (حذف/فعال‌سازی
+    کانفیگ، ساخت کانفیگ جدید و...) باید کامل و با await درون همین درخواست
+    تمام شود. روی هاستینگ سرورلس (مثل Vercel) به‌محض ارسال پاسخ HTTP اجرای
+    تابع متوقف می‌شود، پس هر کاری که به‌صورت پس‌زمینه‌ی بدون-await
+    (asyncio.create_task یا BackgroundTasks) زمان‌بندی شود، ممکن است هرگز
+    اجرا نشود. برای همین همه‌چیز اینجا await می‌شود؛ سرعت با بهینه‌سازی‌های
+    دیگر (throttle رفرش Redis، تایم‌اوت کوتاه‌تر تلگرام، پاسخ زودهنگام
+    callback_query) تأمین شده، نه با اجرای ناقص در پس‌زمینه."""
     token = TG_CONFIG.get("token")
     if not token or not TG_CONFIG.get("enabled") or secret != tg_webhook_secret(token):
         raise HTTPException(status_code=404, detail="not found")
@@ -1436,7 +1442,7 @@ async def telegram_webhook(secret: str, request: Request, background_tasks: Back
         # آپدیت تکراری (retry تلگرام به‌خاطر تأخیر در پاسخ قبلی) — نادیده گرفته می‌شود
         return {"ok": True}
 
-    background_tasks.add_task(_process_telegram_update, token, update)
+    await _process_telegram_update(token, update)
     return {"ok": True}
 
 async def _process_telegram_update(token: str, update: dict):
